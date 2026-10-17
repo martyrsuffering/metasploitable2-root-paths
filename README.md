@@ -1,11 +1,11 @@
-# Metasploitable 2 — 19 способов получить root
+# Metasploitable 2 — 20 способов получить root
 
 > Лабораторная цель: `192.168.56.104` (Metasploitable 2 в VirtualBox, host-only).
-> Сессии 2026-10-15/16/17, волны 1–17. Авторизованный стенд; после каждой волны
+> Сессии 2026-10-15/16/17, волны 1–20. Авторизованный стенд; после каждой волны
 > артефакты вычищались, VM возвращена в стоковое состояние.
-> Полный отчёт со всеми 73 находками — в `metasploitable2-writeup.md`, этот
-> файл — только про root: **19 независимых путей** (20 — с учётом апгрейдов
-> VNC и NFS, которые посчитаны отдельными методами). В конце — приложение,
+> Полный отчёт со всеми 74 находками — в `metasploitable2-writeup.md`, этот
+> файл — только про root: **20 независимых путей** (апгрейды VNC и NFS
+> посчитаны отдельными методами — №14 и №18). В конце — приложение,
 > как берётся www-data (старт половины root-чейнов).
 > Все команды — реально выполненные на живой VM; ловушки указаны по месту.
 
@@ -32,6 +32,7 @@
 | 17 | Rogue-DHCP option-12 → shellshock | L2-сеть → root-команда | 13 |
 | 18 | VNC → интерактивный root-десктоп (RFB-инъекция) | сеть → root | 15 |
 | 19 | SSH key trust: ключ msfadmin в authorized_keys root | msfadmin → root без sudo | 16 |
+| 20 | CVE-2017-6074: DCCPv6 pktopts UAF → fake sk_buff → modprobe_path | msfadmin → root (kernel LPE) | 19 |
 | ⤷ | **Плацдарм (не root сам по себе): www-data** — 7 веб-векторов: PHP-CGI CVE-2012-1823, WebDAV PUT, TWiki, DVWA upload + LFI2RCE, Mutillidae cmd-inj, TikiWiki graph_formula → `uid=33`; старт для №7/№10/№11/№13/№16 (сниппеты — в приложении) | веб, часто без auth → www-data | 2–14 |
 
 ---
@@ -344,6 +345,73 @@ uid=0(root) gid=0(root) groups=0(root)
 работает (двуххоповая цепочка user→msfadmin→sudo→root; bash_history
 подтверждает ручную сборку доверия).
 
+## 20. CVE-2017-6074 — DCCPv6 pktopts UAF (kernel LPE)
+
+Ядро 2.6.24-16-server старше фикса 2017 года и никогда его не получало.
+DCCPv6-листенер с `IPV6_RECVPKTINFO` сохраняет входящий `skb` в
+`inet6_rsk(req)->pktopts` (+1 refcount), но LISTEN-ветка `input.c` освобождает
+его через **`__kfree_skb`**, который игнорирует refcount. `close()` листенера
+дёргает `reqsk_destructor` → `kfree_skb(pktopts)` по уже свободному объекту —
+UAF. Request-sock живёт `DCCP_TIMEOUT_INIT = 3*HZ` (3 c при HZ=100).
+
+Порт под SLAB/i686 (публичный PoC — SLUB/4.4.x86_64):
+
+1. Listener: AF_INET6, SOCK_DCCP, wildcard `[::]:40000`,
+   `IPV6_RECVPKTINFO=1`, `listen()`. Request'ы — на 40000 **с поддельным
+   source `::1`**: иначе DCCP перезаписывает `IP6CB.iif` в общем `skb->cb`
+   (`dccpd_reset_code=TOO_BUSY` → iif=0x900), Response не маршрутизируется и
+   req не создаётся. С `::1` Response уходит через lo.
+2. Спрей: 16 SysV-очередей × 97 `msg_msg` с mtext=168 → kmalloc-192 (слит
+   со `skbuff_head_cache`); fake sk_buff: `cloned=1`, `fclone=CLONE`,
+   `destructor=&ring0`, `end=0x0c000000` (shinfo в user-mm с dataref=2),
+   `head=0`, `users=1`, `fclone_ref=2` (за объектом) — освобождение не
+   трогает чужую память.
+3. `close()` внутри 3-секундного окна → destructor исполняет user-функцию
+   `ring0()` (SMEP нет), та переписывает `modprobe_path` на `/tmp/w19p`.
+4. `execve` файла с magic `0xffffffff` → ENOEXEC → `request_module` →
+   **скрипт исполняется от root**; ставится SUID-bash.
+
+Пруф: `RING0_OK`, `uid=0(root)`, `euid=0(root)` через SUID-bash. После пруфа
+`modprobe_path` восстановлен, артефакты удалены. Детали и ловушки — в
+`metasploitable2-writeup.md` §7.29 + скилл `ctf-dccp-uaf`.
+
+---
+
+## Послесловие — ядерный аудит волны 20: третьего kernel-пути нет
+
+После №20 ядро проверено сплошняком — от mmap/LSM до спящих модулей.
+Вывод: **на этом ядре оружизабельны ровно два независимых kernel-пути —
+№13 (Dirty COW) и №20 (DCCP UAF)**; новых нет.
+
+- **NULL-map класс (vmsplice CVE-2008-0600, sock_sendpage CVE-2009-2692) —
+  мёртв на двух уровнях.** x86 fault-guard (`address + 65536 + 32*words >=
+  esp`) обходится ESP-трюком: `MAP_FIXED|MAP_GROWSDOWN` VMA на 0x10000,
+  `esp=0x10000`, fault по адресу 0 — VMA расширяется вниз. Но
+  `expand_downwards` → `security_file_mmap` → dummy-LSM требует
+  `CAP_SYS_RAWIO` при `addr < mmap_min_addr (65536)`. Живой пруф: root
+  получает `NULL_MAPPED`, msfadmin — SIGSEGV с `si_addr=(nil)` и
+  сохранившейся VMA `10000-11000`. `mremap(..., MREMAP_FIXED, NULL)` тоже
+  EACCES. Класс закрыт.
+- **personality(MMAP_PAGE_ZERO)** переживает SUID-exec, но страница 0
+  создаётся только при `CAP_SYS_RAWIO` — эскалации не даёт. Traced
+  SUID-exec глушит setuid (`Uid: 1000 1000 1000 1000`, `CapEff: 0`); SUID
+  nmap + NSE под personality — лишь вариант пути №11.
+- **CVE-2013-0871** (ptrace/SIGKILL race): код pre-fix, публичного
+  эксплойта нет. **msr CVE-2013-0268**: `/dev/cpu/0/msr` отсутствует,
+  узел 0600 root даже при загрузке модуля.
+- **econet CVE-2010-3848/3850 — латентный, не непривилегированный.**
+  В `af_econet.c` VLA `iov[msg_iovlen+1]`, `UIO_MAXIOV=1024` →
+  1025*8 = 8200 байт на 8K-стек; `ec_dev_ioctl` без CAP_NET_ADMIN. Но
+  `/etc/modprobe.d/aliases` содержит устаревший `alias net-pf-19 af_econet`
+  (модуль — `econet.ko`): `modprobe net-pf-19` → «Module af_econet not
+  found», `socket(AF_ECONET)` → EAFNOSUPPORT. Загрузить может только root
+  — автозагрузки из непривилегированного контекста нет. half_nelson
+  (EDB 17787) к тому же x86_64/2.6.32 и не портирован.
+
+Поэтому в карте выше — по-прежнему 20 путей. Счёт закрыт: ядро 2.6.24
+дало ровно два независимых метода, остальная ядерная поверхность либо
+закрыта защитами (mmap_min_addr/LSM), либо недостижима без root.
+
 ---
 
 ## Приложение — как берётся www-data (плацдарм для №7, №10, №11, №13, №16)
@@ -409,12 +477,17 @@ GET /tiki-graph_formula.php?formula=pow(pi,0)%2bsystem($_GET[c])&c=id
 - **NFS wide-links / Samba traversal** = чтение world-readable файлов,
   не эскалация.
 - **root-хэш** из /etc/shadow не вскрыт словарём (rockyou целиком + best64):
-  пути №1–№19 root не потребовали.
+  пути №1–№20 root не потребовали.
 
 ## Итог
 
-19 путей к root: 6 — без аутентификации по сети (№1–№5, №12), 2 — доверие
+20 путей к root: 6 — без аутентификации по сети (№1–№5, №12), 2 — доверие
 (№6, №19), 2 — креды+sudo (№15, №16), 3 — ядерные/SUID локальные (№7, №11,
-№13), 2 — NFS-семейство (№9, №14), 3 — сетевые чейны с эскалацией
-(№10, №17, №18). Один и тот же рут можно забрать через разные независимые
-слои: бэкдоры сервисов, доверие хостов, ядро, SUID-баги, слабые креды.
+№13), 1 — kernel LPE (№20), 2 — NFS-семейство (№9, №14), 3 — сетевые чейны
+с эскалацией (№10, №17, №18) и VNC-сессия (№8). Один и тот же рут можно
+забрать через разные независимые слои: бэкдоры сервисов, доверие хостов,
+ядро, SUID-баги, слабые креды.
+
+Волна 20 (сплошной ядерный аудит) новых путей не добавила — **20 путей,
+финальный счёт**: ядро 2.6.24 дало ровно два независимых метода (№13 Dirty
+COW и №20 DCCP UAF).
